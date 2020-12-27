@@ -6,64 +6,84 @@
 package offline
 
 import (
+	"context"
+	"crypto/tls"
 	"testing"
 	"time"
 
-	"github.com/ortuman/jackal/storage"
-	"github.com/ortuman/jackal/stream/c2s"
-	"github.com/ortuman/jackal/xml"
+	"github.com/ortuman/jackal/router/host"
+
+	c2srouter "github.com/ortuman/jackal/c2s/router"
+	"github.com/ortuman/jackal/router"
+	memorystorage "github.com/ortuman/jackal/storage/memory"
+	"github.com/ortuman/jackal/stream"
+	"github.com/ortuman/jackal/xmpp"
+	"github.com/ortuman/jackal/xmpp/jid"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 )
 
-func TestOffline_AssociatedNamespaces(t *testing.T) {
-	x := New(&Config{}, nil)
-	require.Equal(t, []string{offlineNamespace}, x.AssociatedNamespaces())
-}
-
 func TestOffline_ArchiveMessage(t *testing.T) {
-	storage.Initialize(&storage.Config{Type: storage.Mock})
-	defer storage.Shutdown()
+	r, s := setupTest("jackal.im")
 
-	j1, _ := xml.NewJID("ortuman", "jackal.im", "balcony", true)
-	j2, _ := xml.NewJID("juliet", "jackal.im", "garden", true)
+	j1, _ := jid.New("ortuman", "jackal.im", "balcony", true)
+	j2, _ := jid.New("juliet", "jackal.im", "garden", true)
 
-	stm := c2s.NewMockStream("abcd", j1)
-	stm.SetDomain("jackal.im")
+	stm := stream.NewMockC2S(uuid.New(), j1)
+	stm.SetPresence(xmpp.NewPresence(j1, j1, xmpp.AvailableType))
 
-	x := New(&Config{QueueSize: 1}, stm)
+	r.Bind(context.Background(), stm)
+
+	x := New(&Config{QueueSize: 1}, nil, r, s)
+	defer func() { _ = x.Shutdown() }()
 
 	msgID := uuid.New()
-	msg := xml.NewMessageType(msgID, "normal")
+	msg := xmpp.NewMessageType(msgID, "normal")
 	msg.SetFromJID(j1)
 	msg.SetToJID(j2)
-	x.ArchiveMessage(msg)
+	x.ArchiveMessage(context.Background(), msg)
 
 	// wait for insertion...
 	time.Sleep(time.Millisecond * 250)
 
-	msgs, err := storage.Instance().FetchOfflineMessages("juliet")
+	msgs, err := s.FetchOfflineMessages(context.Background(), "juliet")
 	require.Nil(t, err)
 	require.Equal(t, 1, len(msgs))
 
-	msg2 := xml.NewMessageType(msgID, "normal")
+	msg2 := xmpp.NewMessageType(msgID, "normal")
 	msg2.SetFromJID(j1)
 	msg2.SetToJID(j2)
 
-	x.ArchiveMessage(msg)
+	x.ArchiveMessage(context.Background(), msg)
 
-	elem := stm.FetchElement()
+	elem := stm.ReceiveElement()
 	require.NotNil(t, elem)
-	require.Equal(t, xml.ErrServiceUnavailable.Error(), elem.Error().Elements().All()[0].Name())
+	require.Equal(t, xmpp.ErrServiceUnavailable.Error(), elem.Error().Elements().All()[0].Name())
 
 	// deliver offline messages...
-	stm2 := c2s.NewMockStream("abcd", j2)
-	stm2.SetDomain("jackal.im")
+	stm2 := stream.NewMockC2S("abcd", j2)
+	stm2.SetPresence(xmpp.NewPresence(j2, j2, xmpp.AvailableType))
 
-	x2 := New(&Config{QueueSize: 1}, stm2)
-	x2.DeliverOfflineMessages()
+	r.Bind(context.Background(), stm2)
 
-	elem = stm2.FetchElement()
+	x2 := New(&Config{QueueSize: 1}, nil, r, s)
+	defer func() { _ = x.Shutdown() }()
+
+	x2.DeliverOfflineMessages(context.Background(), stm2)
+
+	elem = stm2.ReceiveElement()
 	require.NotNil(t, elem)
 	require.Equal(t, msgID, elem.ID())
+}
+
+func setupTest(domain string) (router.Router, *memorystorage.Offline) {
+	hosts, _ := host.New([]host.Config{{Name: domain, Certificate: tls.Certificate{}}})
+
+	s := memorystorage.NewOffline()
+	r, _ := router.New(
+		hosts,
+		c2srouter.New(memorystorage.NewUser(), memorystorage.NewBlockList()),
+		nil,
+	)
+	return r, s
 }

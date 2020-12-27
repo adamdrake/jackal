@@ -8,19 +8,20 @@ package storage
 import (
 	"testing"
 
+	"github.com/ortuman/jackal/storage/mysql"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 func TestStorageConfig(t *testing.T) {
 	cfg := Config{}
 
-	mockCfg := `
-  type: mock
+	memCfg := `
+  type: memory
 `
-	err := yaml.Unmarshal([]byte(mockCfg), &cfg)
+	err := yaml.Unmarshal([]byte(memCfg), &cfg)
 	require.Nil(t, err)
-	require.Equal(t, Mock, cfg.Type)
+	require.Equal(t, Memory, cfg.Type)
 
 	mySQLCfg := `
   type: mysql
@@ -52,7 +53,7 @@ func TestStorageConfig(t *testing.T) {
 	err = yaml.Unmarshal([]byte(mySQLCfg2), &cfg)
 	require.Nil(t, err)
 	require.Equal(t, MySQL, cfg.Type)
-	require.Equal(t, defaultMySQLPoolSize, cfg.MySQL.PoolSize)
+	require.Equal(t, mysql.DefaultPoolSize, cfg.MySQL.PoolSize)
 
 	invalidMySQLCfg := `
   type: mysql
@@ -70,9 +71,9 @@ func TestStorageConfig(t *testing.T) {
 func TestStorageBadConfig(t *testing.T) {
 	cfg := Config{}
 
-	mockCfg := `
+	memCfg := `
   type
 `
-	err := yaml.Unmarshal([]byte(mockCfg), &cfg)
+	err := yaml.Unmarshal([]byte(memCfg), &cfg)
 	require.NotNil(t, err)
 }

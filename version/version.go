@@ -10,7 +10,7 @@ import (
 )
 
 // ApplicationVersion represents application version.
-var ApplicationVersion = NewVersion(0, 2, 0)
+var ApplicationVersion = NewVersion(0, 10, 1)
 
 // SemanticVersion represents version information with Semantic Versioning specifications.
 type SemanticVersion struct {
@@ -30,7 +30,7 @@ func NewVersion(major, minor, patch uint) *SemanticVersion {
 
 // String returns a string that represents this instance.
 func (v *SemanticVersion) String() string {
-	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
+	return fmt.Sprintf("v%d.%d.%d", v.major, v.minor, v.patch)
 }
 
 // IsEqual returns true if version instance is equal to the second.

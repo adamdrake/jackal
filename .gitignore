@@ -10,15 +10,13 @@ debug
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+coverage.txt
 
 # System folders
 .DS_Store
 
 # Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
 .glide/
-
-# Dep folder
-vendor/
 
 # PID files
 *.pid
@@ -37,3 +35,9 @@ server.crt
 # Project folders
 .idea/
 .vscode/
+
+# Dependency 
+vendor/
+
+# Binary 
+jackal

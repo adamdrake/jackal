@@ -6,96 +6,102 @@
 package offline
 
 import (
+	"context"
+
 	"github.com/ortuman/jackal/log"
-	"github.com/ortuman/jackal/storage"
-	"github.com/ortuman/jackal/stream/c2s"
-	"github.com/ortuman/jackal/xml"
+	"github.com/ortuman/jackal/module/xep0030"
+	"github.com/ortuman/jackal/router"
+	"github.com/ortuman/jackal/storage/repository"
+	"github.com/ortuman/jackal/stream"
+	"github.com/ortuman/jackal/util/runqueue"
+	"github.com/ortuman/jackal/xmpp"
 )
 
 const offlineNamespace = "msgoffline"
 
-// Config represents Offline Storage module configuration.
-type Config struct {
-	QueueSize int `yaml:"queue_size"`
-}
+const hintsNamespace = "urn:xmpp:hints"
 
-// ModOffline represents an offline server stream module.
-type ModOffline struct {
-	cfg     *Config
-	stm     c2s.Stream
-	actorCh chan func()
+const offlineDeliveredCtxKey = "offline:delivered"
+
+// Offline represents an offline server stream module.
+type Offline struct {
+	cfg        *Config
+	runQueue   *runqueue.RunQueue
+	router     router.Router
+	offlineRep repository.Offline
 }
 
 // New returns an offline server stream module.
-func New(config *Config, stm c2s.Stream) *ModOffline {
-	r := &ModOffline{
-		cfg:     config,
-		stm:     stm,
-		actorCh: make(chan func(), 32),
+func New(config *Config, disco *xep0030.DiscoInfo, router router.Router, offlineRep repository.Offline) *Offline {
+	r := &Offline{
+		cfg:        config,
+		runQueue:   runqueue.New("xep0030"),
+		router:     router,
+		offlineRep: offlineRep,
 	}
-	if stm != nil {
-		go r.actorLoop(stm.Context().Done())
+	if disco != nil {
+		disco.RegisterServerFeature(offlineNamespace)
 	}
 	return r
 }
 
-// AssociatedNamespaces returns namespaces associated
-// with offline module.
-func (o *ModOffline) AssociatedNamespaces() []string {
-	return []string{offlineNamespace}
-}
-
 // ArchiveMessage archives a new offline messages into the storage.
-func (o *ModOffline) ArchiveMessage(message *xml.Message) {
-	o.actorCh <- func() {
-		o.archiveMessage(message)
-	}
+func (x *Offline) ArchiveMessage(ctx context.Context, message *xmpp.Message) {
+	x.runQueue.Run(func() { x.archiveMessage(ctx, message) })
 }
 
 // DeliverOfflineMessages delivers every archived offline messages to the peer
 // deleting them from storage.
-func (o *ModOffline) DeliverOfflineMessages() {
-	o.actorCh <- func() {
-		o.deliverOfflineMessages()
-	}
+func (x *Offline) DeliverOfflineMessages(ctx context.Context, stm stream.C2S) {
+	x.runQueue.Run(func() { x.deliverOfflineMessages(ctx, stm) })
 }
 
-func (o *ModOffline) actorLoop(doneCh <-chan struct{}) {
-	for {
-		select {
-		case f := <-o.actorCh:
-			f()
-		case <-doneCh:
-			return
-		}
-	}
+// Shutdown shuts down offline module.
+func (x *Offline) Shutdown() error {
+	c := make(chan struct{})
+	x.runQueue.Stop(func() { close(c) })
+	<-c
+	return nil
 }
 
-func (o *ModOffline) archiveMessage(message *xml.Message) {
-	toJid := message.ToJID()
-	queueSize, err := storage.Instance().CountOfflineMessages(toJid.Node())
+func (x *Offline) archiveMessage(ctx context.Context, message *xmpp.Message) {
+	if !isMessageArchivable(message) {
+		return
+	}
+	toJID := message.ToJID()
+	queueSize, err := x.offlineRep.CountOfflineMessages(ctx, toJID.Node())
 	if err != nil {
 		log.Error(err)
 		return
 	}
-	if queueSize >= o.cfg.QueueSize {
-		response := xml.NewElementFromElement(message)
-		response.SetFrom(toJid.String())
-		response.SetTo(o.stm.JID().String())
-		o.stm.SendElement(response.ServiceUnavailableError())
+	if queueSize >= x.cfg.QueueSize {
+		_ = x.router.Route(ctx, message.ServiceUnavailableError())
 		return
 	}
-	delayed := xml.NewElementFromElement(message)
-	delayed.Delay(o.stm.Domain(), "Offline Storage")
-	if err := storage.Instance().InsertOfflineMessage(delayed, toJid.Node()); err != nil {
-		log.Errorf("%v", err)
+	delayed, _ := xmpp.NewMessageFromElement(message, message.FromJID(), message.ToJID())
+	delayed.Delay(message.FromJID().Domain(), "Offline Storage")
+	if err := x.offlineRep.InsertOfflineMessage(ctx, delayed, toJID.Node()); err != nil {
+		log.Error(err)
+		_ = x.router.Route(ctx, message.InternalServerError())
 		return
 	}
 	log.Infof("archived offline message... id: %s", message.ID())
+
+	if x.cfg.Gateway != nil {
+		if err := x.cfg.Gateway.Route(message); err != nil {
+			log.Errorf("bad offline gateway: %v", err)
+		}
+	}
 }
 
-func (o *ModOffline) deliverOfflineMessages() {
-	messages, err := storage.Instance().FetchOfflineMessages(o.stm.Username())
+func (x *Offline) deliverOfflineMessages(ctx context.Context, stm stream.C2S) {
+	delivered, _ := stm.Value(offlineDeliveredCtxKey).(bool)
+	if delivered {
+		return // already delivered
+	}
+	// deliver offline messages
+	userJID := stm.JID()
+	messages, err := x.offlineRep.FetchOfflineMessages(ctx, userJID.Node())
 	if err != nil {
 		log.Error(err)
 		return
@@ -103,12 +109,23 @@ func (o *ModOffline) deliverOfflineMessages() {
 	if len(messages) == 0 {
 		return
 	}
-	log.Infof("delivering offline messages... count: %d", len(messages))
+	log.Infof("delivering offline messages: %s... count: %d", userJID, len(messages))
 
-	for _, m := range messages {
-		o.stm.SendElement(m)
+	for i := 0; i < len(messages); i++ {
+		_ = x.router.Route(ctx, &messages[i])
 	}
-	if err := storage.Instance().DeleteOfflineMessages(o.stm.Username()); err != nil {
+	if err := x.offlineRep.DeleteOfflineMessages(ctx, userJID.Node()); err != nil {
 		log.Error(err)
 	}
+	stm.SetValue(offlineDeliveredCtxKey, true)
+}
+
+func isMessageArchivable(message *xmpp.Message) bool {
+	if message.Elements().ChildNamespace("no-store", hintsNamespace) != nil {
+		return false
+	}
+	if message.Elements().ChildNamespace("store", hintsNamespace) != nil {
+		return true
+	}
+	return message.IsNormal() || (message.IsChat() && message.IsMessageWithBody())
 }
